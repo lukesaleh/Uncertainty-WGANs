@@ -139,7 +139,6 @@ NORMAL2-IM-0376-0001.jpeg,../data/chest_xray/test/NORMAL/NORMAL2-IM-0376-0001.jp
 NORMAL2-IM-0378-0001.jpeg,../data/chest_xray/test/NORMAL/NORMAL2-IM-0378-0001.jpeg,0,test
 NORMAL2-IM-0380-0001.jpeg,../data/chest_xray/test/NORMAL/NORMAL2-IM-0380-0001.jpeg,0,test
 NORMAL2-IM-0381-0001.jpeg,../data/chest_xray/test/NORMAL/NORMAL2-IM-0381-0001.jpeg,0,test
-temp.txt,../data/chest_xray/test/NORMAL/temp.txt,0,test
 person100_bacteria_475.jpeg,../data/chest_xray/test/PNEUMONIA/person100_bacteria_475.jpeg,1,test
 person100_bacteria_477.jpeg,../data/chest_xray/test/PNEUMONIA/person100_bacteria_477.jpeg,1,test
 person100_bacteria_478.jpeg,../data/chest_xray/test/PNEUMONIA/person100_bacteria_478.jpeg,1,test
@@ -530,4 +529,3 @@ person96_bacteria_466.jpeg,../data/chest_xray/test/PNEUMONIA/person96_bacteria_4
 person97_bacteria_468.jpeg,../data/chest_xray/test/PNEUMONIA/person97_bacteria_468.jpeg,1,test
 person99_bacteria_473.jpeg,../data/chest_xray/test/PNEUMONIA/person99_bacteria_473.jpeg,1,test
 person99_bacteria_474.jpeg,../data/chest_xray/test/PNEUMONIA/person99_bacteria_474.jpeg,1,test
-temp.txt,../data/chest_xray/test/PNEUMONIA/temp.txt,1,test

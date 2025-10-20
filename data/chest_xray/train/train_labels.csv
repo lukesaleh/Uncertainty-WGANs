@@ -166,7 +166,6 @@ IM-0349-0001.jpeg,../data/chest_xray/train/NORMAL/IM-0349-0001.jpeg,0,train
 IM-0350-0001.jpeg,../data/chest_xray/train/NORMAL/IM-0350-0001.jpeg,0,train
 IM-0351-0001.jpeg,../data/chest_xray/train/NORMAL/IM-0351-0001.jpeg,0,train
 IM-0353-0001.jpeg,../data/chest_xray/train/NORMAL/IM-0353-0001.jpeg,0,train
-temp.txt,../data/chest_xray/train/NORMAL/temp.txt,0,train
 person5_bacteria_17.jpeg,../data/chest_xray/train/PNEUMONIA/person5_bacteria_17.jpeg,1,train
 person600_bacteria_2456.jpeg,../data/chest_xray/train/PNEUMONIA/person600_bacteria_2456.jpeg,1,train
 person600_bacteria_2457.jpeg,../data/chest_xray/train/PNEUMONIA/person600_bacteria_2457.jpeg,1,train
@@ -298,4 +297,3 @@ person9_bacteria_38.jpeg,../data/chest_xray/train/PNEUMONIA/person9_bacteria_38.
 person9_bacteria_39.jpeg,../data/chest_xray/train/PNEUMONIA/person9_bacteria_39.jpeg,1,train
 person9_bacteria_40.jpeg,../data/chest_xray/train/PNEUMONIA/person9_bacteria_40.jpeg,1,train
 person9_bacteria_41.jpeg,../data/chest_xray/train/PNEUMONIA/person9_bacteria_41.jpeg,1,train
-temp.txt,../data/chest_xray/train/PNEUMONIA/temp.txt,1,train
