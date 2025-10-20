@@ -1,4 +1,7 @@
-data/*
-models/*
+*.jpg
+*.png
+*.jpeg
 logs
+*.pt
+*.pth
 results_tmp
