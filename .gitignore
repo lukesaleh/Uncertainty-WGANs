@@ -5,3 +5,4 @@ logs
 *.pt
 *.pth
 results_tmp
+.env
