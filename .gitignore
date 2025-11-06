@@ -6,3 +6,5 @@ logs
 *.pth
 results_tmp
 .env
+
+data/FashionMNIST/raw/*
