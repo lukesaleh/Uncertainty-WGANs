@@ -1,15 +1,16 @@
 import os
 import math
 import random
-from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split, Subset
+from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms, utils
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # =========================
 # Config
@@ -23,8 +24,8 @@ lambda_gp = 10.0
 uncertainty_lambda = 0.5   
 n_critic = 5               
 patience = 10              
-model_dir = "./models"
-sample_dir = "./samples"
+model_dir = os.getcwd() + "/models/models_uncertainty"
+sample_dir = os.getcwd() + "/results/uncertainty/samples"
 os.makedirs(model_dir, exist_ok=True)
 os.makedirs(sample_dir, exist_ok=True)
 
@@ -35,6 +36,7 @@ MODEL_TO_LOAD = os.path.join(model_dir, "gan_uncertainty_fmnist_best.pth")
 # =========================
 # Data Transforms and Loaders
 # =========================
+print("Loading data...")
 transform = transforms.Compose([
     transforms.ToTensor(),
     # WGAN often uses [-1,1] input; FMNIST is (0,1), so scale:
@@ -49,6 +51,7 @@ train_dataset, val_dataset = random_split(dataset, [train_len, val_len])
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
 val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=True)
+print(f"Train samples: {train_len}, Val samples: {val_len}")
 
 # =========================
 # Models
@@ -91,6 +94,7 @@ class Critic(nn.Module):
 
 G = Generator_Uncertainty(latent_dim).to(device)
 D = Critic().to(device)
+print("Models initialized")
 
 opt_G = optim.Adam(G.parameters(), lr=lr, betas=(beta1, beta2))
 opt_D = optim.Adam(D.parameters(), lr=lr, betas=(beta1, beta2))
@@ -134,8 +138,10 @@ def run_validation():
     val_real_acc = 0.0
     val_fake_acc = 0.0
     count = 0
+    
+    val_bar = tqdm(val_loader, desc="Validation", leave=False)
     with torch.no_grad():
-        for real, _ in val_loader:
+        for real, _ in val_bar:
             real = real.to(device)
             z = gen_rand_noise(real.size(0), latent_dim)
             fake = G(z)
@@ -160,6 +166,7 @@ def run_validation():
 
 
 def train():
+    print("\nStarting training...")
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
@@ -172,7 +179,8 @@ def train():
         running_fake_acc = 0.0
         batches = 0
 
-        for i, (real, _) in enumerate(train_loader):
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}")
+        for i, (real, _) in enumerate(train_bar):
             real = real.to(device)
             bsz = real.size(0) # get current batch size
 
@@ -197,9 +205,7 @@ def train():
 
             # batch means
             with torch.no_grad():
-                # we need current batch of real/fake for means
-                # reuse real_scores from last critic update if you want;
-                # but do a fresh pass for cleanliness
+                # get real scores for mean calculation
                 real_scores_for_mean = D(real)
             mu_fake = fake_scores_for_G.mean().detach()
             mu_real = real_scores_for_mean.mean().detach()
@@ -224,8 +230,15 @@ def train():
             running_real_acc += r_acc
             running_fake_acc += f_acc
             batches += 1
+            
+            # update progress bar
+            train_bar.set_postfix({
+                'D_loss': f'{running_D_loss/batches:.3f}',
+                'G_loss': f'{running_G_loss/batches:.3f}'
+            })
 
         # Validation 
+        print("Running validation...")
         val_loss, val_racc, val_facc = run_validation()
 
         print(f"Epoch [{epoch}/{num_epochs}] "
@@ -237,6 +250,7 @@ def train():
 
         # Save sample every 5 epochs
         if epoch % 10 == 0:
+            print(f"Saving sample images...")
             G.eval()
             with torch.no_grad():
                 sample_z = gen_rand_noise(16, latent_dim)
@@ -249,6 +263,7 @@ def train():
         if val_loss < best_val_loss - 1e-4:
             best_val_loss = val_loss
             epochs_no_improve = 0
+            print(f"New best model! Saving...")
             torch.save({
                 "G": G.state_dict(),
                 "D": D.state_dict(),
@@ -259,11 +274,17 @@ def train():
             if epochs_no_improve >= patience:
                 print(f"Early stopping at epoch {epoch} (best val loss: {best_val_loss:.4f})")
                 break
+    
+    print("Training complete!")
 
 def test():
+    print("Loading model for testing...")
     # Load and generate images
     checkpoint = torch.load(MODEL_TO_LOAD, map_location=device)
     G.load_state_dict(checkpoint["G"])
+    print(f"Loaded model from epoch {checkpoint['epoch']}")
+    
+    print("Generating test images...")
     G.eval()
     with torch.no_grad():
         z = gen_rand_noise(16, latent_dim)
