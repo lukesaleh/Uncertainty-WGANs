@@ -8,10 +8,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms, utils
 from tqdm import tqdm
+import torchvision.transforms.functional as F
+from PIL import Image, ImageDraw, ImageFont
 
 # Import torchmetrics for FID and precision/recall
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
+
+# Import models
+from models import Generator_Uncertainty, Generator_CNN_Uncertainty, Critic, Critic_Simple
 
 # Move data loading into a function to avoid global variables causing issues with multiprocessing in windows
 def get_data_loaders(batch_size):
@@ -32,45 +37,6 @@ def get_data_loaders(batch_size):
     print(f"Train samples: {train_len}, Val samples: {val_len}")
     
     return train_loader, val_loader
-
-# =========================
-# Models
-# =========================
-
-class Generator_Uncertainty(nn.Module):
-    def __init__(self, z_dim=100):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(z_dim, 256),
-            nn.ReLU(True),
-            nn.Linear(256, 512),
-            nn.ReLU(True),
-            nn.Linear(512, 1024),
-            nn.ReLU(True),
-            nn.Linear(1024, 28*28),
-            nn.Tanh()  
-        )
-
-    def forward(self, z):
-        x = self.net(z)
-        return x.view(-1, 1, 28, 28)
-
-class Critic(nn.Module):
-    # WGAN critic: no sigmoid
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 64, 4, 2, 1),  # 14x14
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, 2, 1),  # 7x7
-            nn.InstanceNorm2d(128, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Flatten(),
-            nn.Linear(128*7*7, 1)
-        )
-
-    def forward(self, x):
-        return self.net(x).view(-1)
 
 # Gradient penalty for WGAN-GP during training
 def gradient_penalty(critic, real, fake, device):
@@ -99,6 +65,31 @@ def critic_accuracy(real_scores, fake_scores):
     real_correct = (real_scores > 0).float().mean().item()
     fake_correct = (fake_scores < 0).float().mean().item()
     return real_correct, fake_correct
+
+def add_label_to_image(img_tensor, label, font_size=10):
+    """Add a label (0 or 1) to the top-left corner of an image tensor"""
+    # Convert tensor to PIL Image
+    img = F.to_pil_image(img_tensor)
+    draw = ImageDraw.Draw(img)
+    
+    # Try to use a default font, fallback to default if not available
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except:
+        font = ImageFont.load_default()
+    
+    # Draw white background rectangle for label
+    text = str(label)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    draw.rectangle([0, 0, text_width + 4, text_height + 4], fill='white')
+    
+    # Draw black text
+    draw.text((2, 2), text, fill='black', font=font)
+    
+    # Convert back to tensor
+    return F.to_tensor(img)
 
 # =========================
 # Training and Validation
@@ -187,7 +178,7 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
 
                 opt_D.zero_grad()
                 loss_D.backward()
-                torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=5.0)
                 opt_D.step()
 
             z = gen_rand_noise(bsz, config['latent_dim'], device)
@@ -211,7 +202,7 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
 
             opt_G.zero_grad()
             loss_G.backward()
-            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=5.0)
             opt_G.step()
 
             # track losses and acc
@@ -290,6 +281,9 @@ def test(G, config, device, val_loader):
     num_samples = 2000
     samples_generated = 0
     
+    # Collect some real images for side-by-side comparison
+    real_samples = []
+    
     with torch.no_grad():
         # Generate fake samples
         print("Generating fake samples...")
@@ -312,6 +306,11 @@ def test(G, config, device, val_loader):
         for real, _ in val_loader:
             real = real.to(device)
             
+            # Save first 16 real images for comparison
+            if len(real_samples) < 16:
+                remaining = 16 - len(real_samples)
+                real_samples.append(real[:remaining])
+            
             # Convert to uint8 [0, 255] and RGB
             real_imgs = ((real + 1) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
             real_imgs = real_imgs.repeat(1, 3, 1, 1)
@@ -322,12 +321,75 @@ def test(G, config, device, val_loader):
             if real_processed >= num_samples:
                 break
         
-        # Save sample images
-        print("Saving sample images...")
+        # Concatenate real samples
+        real_samples = torch.cat(real_samples, dim=0)[:16]
+        
+        # Generate 16 fake samples for comparison
+        print("Generating comparison samples...")
         z = gen_rand_noise(16, config['latent_dim'], device)
-        fake_imgs = G(z)
-        fake_imgs = (fake_imgs + 1) / 2.0
-        utils.save_image(fake_imgs, os.path.join(config['sample_dir'], "fake_test.png"), nrow=4)
+        fake_samples = G(z)
+        
+        # Scale to [0, 1] for saving
+        real_samples_scaled = (real_samples + 1) / 2.0
+        fake_samples_scaled = (fake_samples + 1) / 2.0
+        
+        # Add labels to images
+        real_samples_labeled = []
+        fake_samples_labeled = []
+        
+        for i in range(16):
+            real_img_labeled = add_label_to_image(real_samples_scaled[i].cpu(), label=1)
+            fake_img_labeled = add_label_to_image(fake_samples_scaled[i].cpu(), label=0)
+            real_samples_labeled.append(real_img_labeled)
+            fake_samples_labeled.append(fake_img_labeled)
+        
+        real_samples_labeled = torch.stack(real_samples_labeled)
+        fake_samples_labeled = torch.stack(fake_samples_labeled)
+        
+        # Create side-by-side comparison with labels
+        comparison = torch.stack([real_samples_labeled, fake_samples_labeled], dim=1)
+        comparison = comparison.view(-1, 1, 28, 28)  # Flatten to single batch
+        
+        # Save individual sets with labels
+        utils.save_image(real_samples_labeled, 
+                        os.path.join(config['test_dir'], "real_samples_labeled.png"), 
+                        nrow=4, normalize=False)
+        utils.save_image(fake_samples_labeled, 
+                        os.path.join(config['test_dir'], "fake_samples_labeled.png"), 
+                        nrow=4, normalize=False)
+        
+        # Save without labels too
+        utils.save_image(real_samples_scaled, 
+                        os.path.join(config['test_dir'], "real_samples.png"), 
+                        nrow=4, normalize=False)
+        utils.save_image(fake_samples_scaled, 
+                        os.path.join(config['test_dir'], "fake_samples.png"), 
+                        nrow=4, normalize=False)
+        
+        # Save side-by-side comparison with labels
+        utils.save_image(comparison, 
+                        os.path.join(config['test_dir'], "real_vs_fake_comparison_labeled.png"), 
+                        nrow=8, normalize=False)
+        
+        # Save side-by-side comparison without labels
+        comparison_unlabeled = torch.stack([real_samples_scaled, fake_samples_scaled], dim=1)
+        comparison_unlabeled = comparison_unlabeled.view(-1, 1, 28, 28)
+        utils.save_image(comparison_unlabeled, 
+                        os.path.join(config['test_dir'], "real_vs_fake_comparison.png"), 
+                        nrow=8, normalize=False)
+        
+        # Create grid with labels
+        # Top 2 rows = real, bottom 2 rows = fake
+        grid_real = utils.make_grid(real_samples_labeled, nrow=4, normalize=False, padding=2)
+        grid_fake = utils.make_grid(fake_samples_labeled, nrow=4, normalize=False, padding=2)
+        
+        # Stack vertically with a separator
+        separator = torch.ones(3, grid_real.size(1), 5, device='cpu') * 0.5 
+        grid_combined = torch.cat([grid_real, separator, grid_fake], dim=2)
+        
+        utils.save_image(grid_combined, 
+                        os.path.join(config['test_dir'], "real_vs_fake_stacked_labeled.png"), 
+                        normalize=False)
     
     # Compute metrics
     print("\nComputing final metrics...")
@@ -339,7 +401,14 @@ def test(G, config, device, val_loader):
     print(f"{'='*50}")
     print(f"FID Score: {fid_score:.2f}")
     print(f"Inception Score: {is_mean:.2f} ± {is_std:.2f}")
-    print(f"Sample images saved to: {os.path.join(config['sample_dir'], 'fake_test.png')}")
+    print(f"\nSample images saved:")
+    print(f"  - Real samples (unlabeled): {os.path.join(config['test_dir'], 'real_samples.png')}")
+    print(f"  - Fake samples (unlabeled): {os.path.join(config['test_dir'], 'fake_samples.png')}")
+    print(f"  - Real samples (labeled): {os.path.join(config['test_dir'], 'real_samples_labeled.png')}")
+    print(f"  - Fake samples (labeled): {os.path.join(config['test_dir'], 'fake_samples_labeled.png')}")
+    print(f"  - Interleaved comparison (labeled): {os.path.join(config['test_dir'], 'real_vs_fake_comparison_labeled.png')}")
+    print(f"  - Interleaved comparison (unlabeled): {os.path.join(config['test_dir'], 'real_vs_fake_comparison.png')}")
+    print(f"  - Stacked comparison (labeled): {os.path.join(config['test_dir'], 'real_vs_fake_stacked_labeled.png')}")
     print(f"{'='*50}")
 
 if __name__ == "__main__":
@@ -353,33 +422,54 @@ if __name__ == "__main__":
         'batch_size': 64,
         'latent_dim': 100,
         'num_epochs': 100,
-        'lr': 2e-4,
+        'lr_g': 1e-4,  # Generator learning rate
+        'lr_d': 0.8e-4,  # Discriminator learning rate 
         'beta1': 0.5,
         'beta2': 0.9,
         'lambda_gp': 10.0,
-        'uncertainty_lambda': 1.0,
-        'n_critic': 3,
+        'uncertainty_lambda': 0.5,
+        'n_critic': 2, 
         'patience': 10,
         'model_dir': os.path.join(os.getcwd(), "models", "models_uncertainty"),
         'sample_dir': os.path.join(os.getcwd(), "results", "uncertainty", "samples"),
-        'run_test': False
+        'test_dir': os.path.join(os.getcwd(), "results", "uncertainty", "test"),
+        'run_test': True,
+        'use_cnn_generator': False,  # Set to True to use CNN generator
+        'img_size': 28,  # Image size (height and width)
+        'img_channels': 1  # 1 for grayscale, 3 for RGB
     }
     config['model_to_load'] = os.path.join(config['model_dir'], "gan_uncertainty_fmnist_best.pth")
 
     # Create directories
     os.makedirs(config['model_dir'], exist_ok=True)
     os.makedirs(config['sample_dir'], exist_ok=True)
+    os.makedirs(config['test_dir'], exist_ok=True)
 
     # Get data loaders
     train_loader, val_loader = get_data_loaders(config['batch_size'])
     
-    # Initialize models
-    G = Generator_Uncertainty(config['latent_dim']).to(device)
-    D = Critic().to(device)
+    # Initialize models based on config
+    if config['use_cnn_generator']:
+        print("Using CNN-based generator")
+        G = Generator_CNN_Uncertainty(
+            z_dim=config['latent_dim'],
+            img_channels=config['img_channels'],
+            img_size=config['img_size']
+        ).to(device)
+        D = Critic(
+            img_channels=config['img_channels'],
+            img_size=config['img_size']
+        ).to(device)
+    else:
+        print("Using fully connected generator")
+        G = Generator_Uncertainty(config['latent_dim']).to(device)
+        D = Critic_Simple().to(device)
+    
     print("Models initialized")
 
-    opt_G = optim.Adam(G.parameters(), lr=config['lr'], betas=(config['beta1'], config['beta2']))
-    opt_D = optim.Adam(D.parameters(), lr=config['lr'], betas=(config['beta1'], config['beta2']))
+    # SEPARATE LEARNING RATES
+    opt_G = optim.Adam(G.parameters(), lr=config['lr_g'], betas=(config['beta1'], config['beta2']))
+    opt_D = optim.Adam(D.parameters(), lr=config['lr_d'], betas=(config['beta1'], config['beta2']))
     
     if config['run_test']:
         test(G, config, device, val_loader)
