@@ -9,49 +9,25 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms, utils
 from tqdm import tqdm
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# Move data loading into a function to avoid global variables causing issues with multiprocessing in windows
+def get_data_loaders():
+    print("Loading data...")
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
 
-# =========================
-# Config
-# =========================
-batch_size = 64
-latent_dim = 100
-num_epochs = 100
-lr = 2e-4
-beta1, beta2 = 0.5, 0.9
-lambda_gp = 10.0
-uncertainty_lambda = 0.5   
-n_critic = 5               
-patience = 10              
-model_dir = os.getcwd() + "/models/models_uncertainty"
-sample_dir = os.getcwd() + "/results/uncertainty/samples"
-os.makedirs(model_dir, exist_ok=True)
-os.makedirs(sample_dir, exist_ok=True)
+    dataset = datasets.FashionMNIST(root="./data", train=True, download=True, transform=transform)
 
-# Turn this on to run test/inference instead of training
-RUN_TEST = False
-MODEL_TO_LOAD = os.path.join(model_dir, "gan_uncertainty_fmnist_best.pth")
+    train_len = int(0.8 * len(dataset))
+    val_len = len(dataset) - train_len
+    train_dataset, val_dataset = random_split(dataset, [train_len, val_len])
 
-# =========================
-# Data Transforms and Loaders
-# =========================
-print("Loading data...")
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    # WGAN often uses [-1,1] input; FMNIST is (0,1), so scale:
-    transforms.Normalize((0.5,), (0.5,))
-])
-
-dataset = datasets.FashionMNIST(root="./data", train=True, download=True, transform=transform)
-
-train_len = int(0.8 * len(dataset))
-val_len = len(dataset) - train_len
-train_dataset, val_dataset = random_split(dataset, [train_len, val_len])
-
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
-val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=True)
-print(f"Train samples: {train_len}, Val samples: {val_len}")
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=True, persistent_workers=True)
+    print(f"Train samples: {train_len}, Val samples: {val_len}")
+    
+    return train_loader, val_loader
 
 # =========================
 # Models
@@ -92,12 +68,7 @@ class Critic(nn.Module):
     def forward(self, x):
         return self.net(x).view(-1)
 
-G = Generator_Uncertainty(latent_dim).to(device)
-D = Critic().to(device)
-print("Models initialized")
 
-opt_G = optim.Adam(G.parameters(), lr=lr, betas=(beta1, beta2))
-opt_D = optim.Adam(D.parameters(), lr=lr, betas=(beta1, beta2))
 
 # Gradient penalty for WGAN-GP during training
 def gradient_penalty(critic, real, fake):
@@ -196,6 +167,7 @@ def train():
 
                 opt_D.zero_grad()
                 loss_D.backward()
+                torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=1.0)  # add gradient clipping
                 opt_D.step()
 
             
@@ -221,6 +193,7 @@ def train():
 
             opt_G.zero_grad()
             loss_G.backward()
+            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)  # add gradient clipping
             opt_G.step()
 
             # track losses and acc
@@ -280,7 +253,7 @@ def train():
 def test():
     print("Loading model for testing...")
     # Load and generate images
-    checkpoint = torch.load(MODEL_TO_LOAD, map_location=device)
+    checkpoint = torch.load(model_to_load, map_location=device)
     G.load_state_dict(checkpoint["G"])
     print(f"Loaded model from epoch {checkpoint['epoch']}")
     
@@ -294,7 +267,43 @@ def test():
     print("Test samples saved to:", os.path.join(sample_dir, "fake_test.png"))
 
 if __name__ == "__main__":
-    if RUN_TEST:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # =========================
+    # Config
+    # =========================
+    batch_size = 64
+    latent_dim = 100
+    num_epochs = 100
+    lr = 2e-4
+    beta1, beta2 = 0.5, 0.9
+    lambda_gp = 10.0
+    uncertainty_lambda = 1.0   
+    n_critic = 3               
+    patience = 10              
+    model_dir = os.getcwd() + "/models/models_uncertainty"
+    sample_dir = os.getcwd() + "/results/uncertainty/samples"
+
+    # Turn this on to run test/inference instead of training
+    run_test = False
+    model_to_load = os.path.join(model_dir, "gan_uncertainty_fmnist_best.pth")
+
+
+
+    # Create directories here
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(sample_dir, exist_ok=True)
+
+    # Get data loaders
+    train_loader, val_loader = get_data_loaders()
+    G = Generator_Uncertainty(latent_dim).to(device)
+    D = Critic().to(device)
+    print("Models initialized")
+
+    opt_G = optim.Adam(G.parameters(), lr=lr, betas=(beta1, beta2))
+    opt_D = optim.Adam(D.parameters(), lr=lr, betas=(beta1, beta2))
+    if run_test:
         test()
     else:
         train()
