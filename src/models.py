@@ -175,13 +175,13 @@ class Critic(nn.Module):
 
 # Simple Critic for 28x28 images (Original)
 class Critic_Simple(nn.Module):
-    """Simple critic specifically for 28x28 images (FashionMNIST)"""
+    """Simple critic specifically for FashionMNIST"""
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 64, 4, 2, 1),  # 14x14
+            nn.Conv2d(1, 64, 4, 2, 1), 
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, 2, 1),  # 7x7
+            nn.Conv2d(64, 128, 4, 2, 1),  
             nn.InstanceNorm2d(128, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Flatten(),

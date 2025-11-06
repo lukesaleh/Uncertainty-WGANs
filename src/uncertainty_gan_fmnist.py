@@ -254,7 +254,7 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
                 "D": D.state_dict(),
                 "epoch": epoch,
                 "fid": fid_score
-            }, os.path.join(config['model_dir'], "gan_uncertainty_fmnist_best.pth"))
+            }, os.path.join(config['model_dir'], "gan_uncertainty_fmnist_best_" + config['model_name_append'] + ".pth"))
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= config['patience']:
@@ -348,7 +348,7 @@ def test(G, config, device, val_loader):
         
         # Create side-by-side comparison with labels
         comparison = torch.stack([real_samples_labeled, fake_samples_labeled], dim=1)
-        comparison = comparison.view(-1, 1, 28, 28)  # Flatten to single batch
+        comparison = comparison.view(-1, 1, 28, 28) 
         
         # Save individual sets with labels
         utils.save_image(real_samples_labeled, 
@@ -422,43 +422,65 @@ if __name__ == "__main__":
         'batch_size': 64,
         'latent_dim': 100,
         'num_epochs': 100,
-        'lr_g': 1e-4,  # Generator learning rate
-        'lr_d': 0.8e-4,  # Discriminator learning rate 
+        'lr_g': 1e-4,
+        'lr_d': 0.8e-4,
         'beta1': 0.5,
         'beta2': 0.9,
         'lambda_gp': 10.0,
         'uncertainty_lambda': 0.5,
         'n_critic': 2, 
         'patience': 10,
-        'model_dir': os.path.join(os.getcwd(), "models", "models_uncertainty"),
-        'sample_dir': os.path.join(os.getcwd(), "results", "uncertainty", "samples"),
-        'test_dir': os.path.join(os.getcwd(), "results", "uncertainty", "test"),
-        'run_test': True,
-        'use_cnn_generator': False,  # Set to True to use CNN generator
-        'img_size': 28,  # Image size (height and width)
+        'run_test': False,
+        'use_cnn_generator': True,  # Set to True to use CNN generator
+        'img_height': 28,  # Image height
+        'img_width': 28,   # Image width
         'img_channels': 1  # 1 for grayscale, 3 for RGB
     }
-    config['model_to_load'] = os.path.join(config['model_dir'], "gan_uncertainty_fmnist_best.pth")
+
+    # Set model type and create separate directories for CNN vs MLP
+    if config['use_cnn_generator']:
+        model_type = "cnn"
+        config['model_name_append'] = "cnn"
+    else:
+        model_type = "mlp"
+        config['model_name_append'] = "mlp"
+    
+    # Create separate directories for each model type
+    config['model_dir'] = os.path.join(os.getcwd(), "models", "models_uncertainty", model_type)
+    config['sample_dir'] = os.path.join(os.getcwd(), "results", "uncertainty", model_type, "samples")
+    config['test_dir'] = os.path.join(os.getcwd(), "results", "uncertainty", model_type, "test")
+    
+    # Set model path to load
+    config['model_to_load'] = os.path.join(config['model_dir'], f"gan_uncertainty_fmnist_best_{model_type}.pth")
 
     # Create directories
     os.makedirs(config['model_dir'], exist_ok=True)
     os.makedirs(config['sample_dir'], exist_ok=True)
     os.makedirs(config['test_dir'], exist_ok=True)
 
+    print(f"\n{'='*60}")
+    print(f"Model Type: {model_type.upper()}")
+    print(f"Model Directory: {config['model_dir']}")
+    print(f"Sample Directory: {config['sample_dir']}")
+    print(f"Test Directory: {config['test_dir']}")
+    print(f"{'='*60}\n")
+
     # Get data loaders
     train_loader, val_loader = get_data_loaders(config['batch_size'])
     
     # Initialize models based on config
     if config['use_cnn_generator']:
-        print("Using CNN-based generator")
+        print(f"Using CNN-based generator for {config['img_height']}x{config['img_width']} images")
         G = Generator_CNN_Uncertainty(
             z_dim=config['latent_dim'],
             img_channels=config['img_channels'],
-            img_size=config['img_size']
+            img_height=config['img_height'],
+            img_width=config['img_width']
         ).to(device)
         D = Critic(
             img_channels=config['img_channels'],
-            img_size=config['img_size']
+            img_height=config['img_height'],
+            img_width=config['img_width']
         ).to(device)
     else:
         print("Using fully connected generator")
