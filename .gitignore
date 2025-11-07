@@ -10,3 +10,4 @@ results_tmp
 data/FashionMNIST/raw/*
 __pycache__/
 .ipynb_checkpoints
+scripts/
