@@ -188,34 +188,70 @@ def get_data_loaders(batch_size, img_height=256, img_width=256, val_split=0.15, 
     
     # Optimize workers for multi-GPU
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    num_workers = min(8 * num_gpus, os.cpu_count() - 2) if os.cpu_count() is not None else 4
+    cpu_count = os.cpu_count() if os.cpu_count() is not None else 8
     
-    print(f"Using {num_workers} DataLoader workers for {num_gpus} GPU(s)")
+    # For DDP: os.cpu_count() returns total, but we get cpus-per-task via SLURM
+    if dist.is_initialized():
+        # With DDP, each process gets its own CPUs
+        cpus_per_process = int(os.environ.get('SLURM_CPUS_PER_TASK', cpu_count))
+        num_workers = min(12, cpus_per_process - 2)  # Cap at 12, leave 2 for main
+        print(f"\nDDP Mode: {cpus_per_process} CPUs per process")
+    elif num_gpus >= 4:
+        # DataParallel with 4+ GPUs
+        num_workers = min(16 * num_gpus, cpu_count - 4)
+    else:
+        num_workers = min(8 * num_gpus, cpu_count - 2)
+    
+    num_workers = max(4, num_workers)  # Minimum 4 workers
+    
+    print(f"\nDataLoader Configuration:")
+    print(f"  GPUs: {num_gpus}")
+    print(f"  CPU cores available: {cpu_count}")
+    print(f"  DataLoader workers: {num_workers}")
+    if dist.is_initialized():
+        print(f"  Mode: DistributedDataParallel")
+        print(f"  Workers per process: {num_workers}")
+    else:
+        print(f"  Mode: {'DataParallel' if num_gpus > 1 else 'Single GPU'}")
+        print(f"  Workers per GPU: {num_workers // num_gpus if num_gpus > 1 else num_workers}")
     
     persistent = True
+    
+    # Create samplers for DDP
+    train_sampler = None
+    val_sampler = None
+    shuffle_train = True
+    
+    if dist.is_initialized():
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        shuffle_train = False  # Sampler handles shuffling
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle_train,
+        sampler=train_sampler,  # Add this
         num_workers=num_workers,
         drop_last=True,
         pin_memory=True,  # Enable for faster GPU transfer
         collate_fn=collate_fn,
-        persistent_workers=persistent if num_workers > 0 else False,
-        prefetch_factor=2  # Prefetch batches
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4  if num_gpus > 1 else 2
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,  # Add this
         num_workers=num_workers,
         drop_last=True,
-        pin_memory=False,
+        pin_memory=True if num_gpus > 1 else False,  # Enable pin_memory for validation too
         collate_fn=collate_fn,
-        persistent_workers=False
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_gpus > 1 else 2
     )
     
     test_loader = DataLoader(
@@ -392,27 +428,51 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
     epochs_no_improve = 0
     start_epoch = 1
     
+    # Determine if this is the main process (rank 0) for saving
+    is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+    
     # Load from checkpoint if enabled and checkpoint exists
     if config.get('resume_from_checkpoint', False):
         checkpoint_path = config.get('checkpoint_to_load', None)
         
         if checkpoint_path and os.path.exists(checkpoint_path):
-            print(f"\nLoading checkpoint from: {checkpoint_path}")
+            if is_main_process:
+                print(f"\nLoading checkpoint from: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             
-            G.load_state_dict(checkpoint['G'])
-            D.load_state_dict(checkpoint['D'])
+            # Handle loading from different parallelization schemes
+            g_state_dict = checkpoint['G']
+            d_state_dict = checkpoint['D']
+            
+            # Remove 'module.' prefix if present (from DataParallel checkpoint)
+            if list(g_state_dict.keys())[0].startswith('module.'):
+                g_state_dict = {k.replace('module.', ''): v for k, v in g_state_dict.items()}
+                d_state_dict = {k.replace('module.', ''): v for k, v in d_state_dict.items()}
+            
+            # Load into model
+            if dist.is_initialized():
+                G.module.load_state_dict(g_state_dict)
+                D.module.load_state_dict(d_state_dict)
+            elif isinstance(G, nn.DataParallel):
+                G.module.load_state_dict(g_state_dict)
+                D.module.load_state_dict(d_state_dict)
+            else:
+                G.load_state_dict(g_state_dict)
+                D.load_state_dict(d_state_dict)
+            
             opt_G.load_state_dict(checkpoint['opt_G'])
             opt_D.load_state_dict(checkpoint['opt_D'])
             start_epoch = checkpoint['epoch'] + 1
             best_fid = checkpoint.get('best_fid', float("inf"))
             
-            print(f"Resumed from epoch {checkpoint['epoch']}")
-            print(f"Best FID so far: {best_fid:.2f}")
-            print(f"Continuing training from epoch {start_epoch}\n")
+            if is_main_process:
+                print(f"Resumed from epoch {checkpoint['epoch']}")
+                print(f"Best FID so far: {best_fid:.2f}")
+                print(f"Continuing training from epoch {start_epoch}\n")
         else:
-            print(f"\nWarning: resume_from_checkpoint=True but checkpoint not found at {checkpoint_path}")
-            print("Starting training from scratch...\n")
+            if is_main_process:
+                print(f"\nWarning: resume_from_checkpoint=True but checkpoint not found at {checkpoint_path}")
+                print("Starting training from scratch...\n")
 
     for epoch in range(start_epoch, config['num_epochs'] + 1):
         G.train()
@@ -423,7 +483,12 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
         running_fake_acc = 0.0
         batches = 0
 
-        train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{config['num_epochs']}")
+        # Only show progress bar on main process
+        if is_main_process:
+            train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{config['num_epochs']}")
+        else:
+            train_bar = train_loader
+            
         for i, (real, _) in enumerate(train_bar):
             real = real.to(device)
             bsz = real.size(0)
@@ -479,33 +544,49 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
             if i % 50 == 0:
                 torch.cuda.empty_cache()
             
-            # update progress bar
-            train_bar.set_postfix({
-                'D_loss': f'{running_D_loss/batches:.3f}',
-                'G_loss': f'{running_G_loss/batches:.3f}'
-            })
+            # update progress bar (only on main process)
+            if is_main_process and hasattr(train_bar, 'set_postfix'):
+                train_bar.set_postfix({
+                    'D_loss': f'{running_D_loss/batches:.3f}',
+                    'G_loss': f'{running_G_loss/batches:.3f}'
+                })
+
+        # Synchronize all processes before validation
+        if dist.is_initialized():
+            dist.barrier()
 
         # Validation with limited FID samples
-        print("Running validation...")
+        if is_main_process:
+            print("Running validation...")
         val_loss, val_racc, val_facc, fid_score = run_validation(
             G, D, val_loader, config['latent_dim'], device,
             max_fid_samples=config.get('max_fid_samples', 5000)
         )
 
-        print(f"Epoch [{epoch}/{config['num_epochs']}] "
-              f"Train D loss: {running_D_loss/batches:.4f} | "
-              f"Train G loss: {running_G_loss/batches:.4f} | "
-              f"Train D real acc: {running_real_acc/batches:.3f} | "
-              f"Train D fake acc: {running_fake_acc/batches:.3f} || "
-              f"Val D loss: {val_loss:.4f} | Val real acc: {val_racc:.3f} | "
-              f"Val fake acc: {val_facc:.3f} | FID: {fid_score:.2f}")
+        if is_main_process:
+            print(f"Epoch [{epoch}/{config['num_epochs']}] "
+                  f"Train D loss: {running_D_loss/batches:.4f} | "
+                  f"Train G loss: {running_G_loss/batches:.4f} | "
+                  f"Train D real acc: {running_real_acc/batches:.3f} | "
+                  f"Train D fake acc: {running_fake_acc/batches:.3f} || "
+                  f"Val D loss: {val_loss:.4f} | Val real acc: {val_racc:.3f} | "
+                  f"Val fake acc: {val_facc:.3f} | FID: {fid_score:.2f}")
 
-        # Save checkpoint every 3 epochs
-        if epoch % 3 == 0:
+        # Save checkpoint every 3 epochs (only on main process)
+        if epoch % 3 == 0 and is_main_process:
             print(f"Saving checkpoint at epoch {epoch}...")
+            
+            # Get state dict from DDP module if needed
+            if dist.is_initialized():
+                g_state = G.module.state_dict()
+                d_state = D.module.state_dict()
+            else:
+                g_state = G.state_dict()
+                d_state = D.state_dict()
+            
             checkpoint_data = {
-                "G": G.state_dict(),
-                "D": D.state_dict(),
+                "G": g_state,
+                "D": d_state,
                 "opt_G": opt_G.state_dict(),
                 "opt_D": opt_D.state_dict(),
                 "epoch": epoch,
@@ -518,8 +599,8 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
             torch.save(checkpoint_data, 
                       os.path.join(config['checkpoint_dir'], f"checkpoint_epoch_{epoch}.pth"))
         
-        # Save sample every 5 epochs
-        if epoch % 5 == 0 or epoch == 1:
+        # Save sample every 5 epochs (only on main process)
+        if (epoch % 5 == 0 or epoch == 1) and is_main_process:
             print(f"Saving sample images...")
             G.eval()
             with torch.no_grad():
@@ -529,27 +610,44 @@ def train(G, D, opt_G, opt_D, train_loader, val_loader, config, device):
                 utils.save_image(fake_imgs, os.path.join(config['sample_dir'], f"fake_epoch_{epoch}.png"), nrow=4)
             G.train()
 
-        # Early stopping based on FID
+        # Synchronize before checking early stopping
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Early stopping based on FID (only main process saves best model)
         if fid_score < best_fid - 0.5:
             best_fid = fid_score
             epochs_no_improve = 0
-            print(f"New best FID! ({fid_score:.2f}) Saving...")
-            torch.save({
-                "G": G.state_dict(),
-                "D": D.state_dict(),
-                "epoch": epoch,
-                "fid": fid_score
-            }, os.path.join(config['model_dir'], f"gan_uncertainty_xray_best_{config['model_name_append']}.pth"))
+            
+            if is_main_process:
+                print(f"New best FID! ({fid_score:.2f}) Saving...")
+                
+                # Get state dict from DDP module if needed
+                if dist.is_initialized():
+                    g_state = G.module.state_dict()
+                    d_state = D.module.state_dict()
+                else:
+                    g_state = G.state_dict()
+                    d_state = D.state_dict()
+                
+                torch.save({
+                    "G": g_state,
+                    "D": d_state,
+                    "epoch": epoch,
+                    "fid": fid_score
+                }, os.path.join(config['model_dir'], f"gan_uncertainty_xray_best_{config['model_name_append']}.pth"))
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= config['patience']:
-                print(f"Early stopping at epoch {epoch} (best FID: {best_fid:.2f})")
+                if is_main_process:
+                    print(f"Early stopping at epoch {epoch} (best FID: {best_fid:.2f})")
                 break
         
         # Clear cache after epoch
         torch.cuda.empty_cache()
     
-    print("Training complete!")
+    if is_main_process:
+        print("Training complete!")
 
 def test(G, config, device, test_loader):
     print("Loading model for testing...")
@@ -650,30 +748,75 @@ def test(G, config, device, test_loader):
     print(f"{'='*50}")
 
 def setup_distributed():
-    """Initialize distributed training"""
+    """Initialize distributed training for both torchrun and SLURM"""
+    # Check if running with torchrun
     if 'WORLD_SIZE' in os.environ:
         dist.init_process_group(backend='nccl')
         local_rank = int(os.environ['LOCAL_RANK'])
         torch.cuda.set_device(local_rank)
         return local_rank
+    
+    # Check if running with SLURM
+    elif 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        local_rank = int(os.environ['SLURM_LOCALID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        
+        # Initialize process group
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
+        
+        torch.cuda.set_device(local_rank)
+        return local_rank
+    
+    # No distributed training
     return 0
 
 if __name__ == "__main__":
     os.environ['HF_HOME'] = '/blue/azare/lukesaleh/.cache/huggingface'
     os.environ['HF_DATASETS_CACHE'] = '/blue/azare/lukesaleh/.cache/huggingface/datasets'
+    os.environ['TORCH_HOME'] = '/blue/azare/lukesaleh/.cache/torch'
+    os.environ['TORCH_HUB'] = '/blue/azare/lukesaleh/.cache/torch/hub'
     
     # Setup distributed training if available
     local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     
-    print(f"Using device: {device}")
+    # Performance diagnostics
+    print(f"\n{'='*70}")
+    print(f"SYSTEM CONFIGURATION")
+    print(f"{'='*70}")
+    print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPUs available: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"    Memory: {props.total_memory / 1e9:.1f} GB")
+            print(f"    Compute Capability: {props.major}.{props.minor}")
+    print(f"CPU cores: {os.cpu_count()}")
+    print(f"{'='*70}\n")
 
     # Config for NIH dataset
     use_cnn = True
     
     if use_cnn:
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        
+        # Scale batch size with GPU count
+        if num_gpus >= 4:
+            base_batch_size = 256  # 1024 total for 4 GPUs
+        elif num_gpus >= 2:
+            base_batch_size = 128  # 256-512 total
+        else:
+            base_batch_size = 64   # Single GPU
+        
         config = {
-            'batch_size': 64,        
+            'batch_size': base_batch_size * num_gpus,
             'latent_dim': 128,
             'num_epochs': 200,
             'lr_g': 2e-4,
@@ -690,9 +833,14 @@ if __name__ == "__main__":
             'img_width': 128,       
             'img_channels': 1,
             'max_fid_samples': 5000,
-            'resume_from_checkpoint': False,  # Set to True to resume from checkpoint
-            'checkpoint_to_load': None  # Will be set automatically below if resume is True
+            'resume_from_checkpoint': True,
+            'checkpoint_to_load': None
         }
+        
+        print(f"\nMulti-GPU Setup:")
+        print(f"  GPUs: {num_gpus}")
+        print(f"  Total batch size: {config['batch_size']}")
+        print(f"  Per-GPU batch size: {base_batch_size}")
     
     # Set model type
     if config['use_cnn_generator']:
