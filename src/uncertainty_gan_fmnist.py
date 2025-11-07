@@ -422,15 +422,15 @@ if __name__ == "__main__":
         'batch_size': 64,
         'latent_dim': 100,
         'num_epochs': 100,
-        'lr_g': 1e-4,
-        'lr_d': 0.8e-4,
+        'lr_g': 2e-4,
+        'lr_d': 5e-5,
         'beta1': 0.5,
         'beta2': 0.9,
         'lambda_gp': 10.0,
         'uncertainty_lambda': 0.5,
-        'n_critic': 2, 
+        'n_critic': 3, 
         'patience': 10,
-        'run_test': False,
+        'run_test': True,
         'use_cnn_generator': True,  # Set to True to use CNN generator
         'img_height': 28,  # Image height
         'img_width': 28,   # Image width

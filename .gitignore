@@ -8,3 +8,5 @@ results_tmp
 .env
 
 data/FashionMNIST/raw/*
+__pycache__/
+.ipynb_checkpoints
