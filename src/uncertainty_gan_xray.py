@@ -21,6 +21,11 @@ from torchmetrics.image.inception import InceptionScore
 # Import models
 from models import Generator_Uncertainty, Generator_CNN_Uncertainty, Critic, Critic_Simple
 
+# Import distributed training utilities
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 # Define collate_fn at module level for Windows compatibility
 def collate_fn(batch):
     """Custom collate function to handle numpy arrays from HuggingFace dataset"""
@@ -181,8 +186,13 @@ def get_data_loaders(batch_size, img_height=256, img_width=256, val_split=0.15, 
     print(f"\nImage Size:     {img_height}x{img_width}")
     print(f"{'='*70}\n")
     
-    num_workers = os.cpu_count()/2 if os.cpu_count() is not None and os.cpu_count() > 2 else 0 
-    persistent = False
+    # Optimize workers for multi-GPU
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    num_workers = min(8 * num_gpus, os.cpu_count() - 2) if os.cpu_count() is not None else 4
+    
+    print(f"Using {num_workers} DataLoader workers for {num_gpus} GPU(s)")
+    
+    persistent = True
     
     # Create data loaders
     train_loader = DataLoader(
@@ -191,9 +201,10 @@ def get_data_loaders(batch_size, img_height=256, img_width=256, val_split=0.15, 
         shuffle=True,
         num_workers=num_workers,
         drop_last=True,
-        pin_memory=False,
+        pin_memory=True,  # Enable for faster GPU transfer
         collate_fn=collate_fn,
-        persistent_workers=persistent if num_workers > 0 else False
+        persistent_workers=persistent if num_workers > 0 else False,
+        prefetch_factor=2  # Prefetch batches
     )
     
     val_loader = DataLoader(
@@ -204,7 +215,7 @@ def get_data_loaders(batch_size, img_height=256, img_width=256, val_split=0.15, 
         drop_last=True,
         pin_memory=False,
         collate_fn=collate_fn,
-        persistent_workers=persistent if num_workers > 0 else False
+        persistent_workers=False
     )
     
     test_loader = DataLoader(
@@ -224,17 +235,31 @@ def get_data_loaders(batch_size, img_height=256, img_width=256, val_split=0.15, 
 # Gradient penalty for WGAN-GP during training
 def gradient_penalty(critic, real, fake, device):
     batch_size = real.size(0)
-    epsilon = torch.rand(batch_size, 1, 1, 1, device=device, requires_grad=True)
-    interp = epsilon * real + (1 - epsilon) * fake
-    interp_scores = critic(interp)
+    
+    # Ensure epsilon is on the same device as real/fake
+    epsilon = torch.rand(batch_size, 1, 1, 1, device=real.device, dtype=real.dtype)
+    
+    # Create interpolated samples
+    interp = (epsilon * real + (1 - epsilon) * fake).detach()
+    interp.requires_grad_(True)
+    
+    # Forward pass - handle DataParallel module access
+    if isinstance(critic, nn.DataParallel):
+        interp_scores = critic.module(interp)
+    else:
+        interp_scores = critic(interp)
+    
+    # Compute gradients
     grads = torch.autograd.grad(
         outputs=interp_scores,
         inputs=interp,
-        grad_outputs=torch.ones_like(interp_scores),
+        grad_outputs=torch.ones_like(interp_scores, device=interp_scores.device),
         create_graph=True,
         retain_graph=True,
         only_inputs=True
     )[0]
+    
+    # Flatten and compute penalty
     grads = grads.view(batch_size, -1)
     gp = ((grads.norm(2, dim=1) - 1) ** 2).mean()
     return gp
@@ -624,8 +649,23 @@ def test(G, config, device, test_loader):
     print(f"\nSample images saved to: {config['test_dir']}")
     print(f"{'='*50}")
 
+def setup_distributed():
+    """Initialize distributed training"""
+    if 'WORLD_SIZE' in os.environ:
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        return local_rank
+    return 0
+
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.environ['HF_HOME'] = '/blue/azare/lukesaleh/.cache/huggingface'
+    os.environ['HF_DATASETS_CACHE'] = '/blue/azare/lukesaleh/.cache/huggingface/datasets'
+    
+    # Setup distributed training if available
+    local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    
     print(f"Using device: {device}")
 
     # Config for NIH dataset
@@ -633,7 +673,7 @@ if __name__ == "__main__":
     
     if use_cnn:
         config = {
-            'batch_size': 4,        
+            'batch_size': 64,        
             'latent_dim': 128,
             'num_epochs': 200,
             'lr_g': 2e-4,
@@ -714,7 +754,7 @@ if __name__ == "__main__":
         max_samples=None 
     )
     
-    # Initialize models
+    # Initialize models (on CPU first)
     if config['use_cnn_generator']:
         print(f"Using CNN-based generator for {config['img_height']}x{config['img_width']} X-ray images")
         G = Generator_CNN_Uncertainty(
@@ -722,20 +762,45 @@ if __name__ == "__main__":
             img_channels=config['img_channels'],
             img_height=config['img_height'],
             img_width=config['img_width']
-        ).to(device)
+        )
         D = Critic(
             img_channels=config['img_channels'],
             img_height=config['img_height'],
             img_width=config['img_width']
-        ).to(device)
+        )
     else:
         print("Using fully connected generator")
-        G = Generator_Uncertainty(config['latent_dim']).to(device)
-        D = Critic_Simple().to(device)
+        G = Generator_Uncertainty(config['latent_dim'])
+        D = Critic_Simple()
     
+    # Print model info before parallelization
     print("Models initialized")
     print(f"Generator parameters: {sum(p.numel() for p in G.parameters()):,}")
     print(f"Discriminator parameters: {sum(p.numel() for p in D.parameters()):,}")
+    
+    # Move to device FIRST, then wrap with DDP/DataParallel
+    if dist.is_initialized():
+        # DistributedDataParallel: move to device first, then wrap
+        G = G.to(device)
+        D = D.to(device)
+        G = DDP(G, device_ids=[local_rank])
+        D = DDP(D, device_ids=[local_rank])
+        print(f"Using DistributedDataParallel on GPU {local_rank}")
+    elif torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        # DataParallel: move to device first, then wrap
+        G = G.to(device)
+        D = D.to(device)
+        G = nn.DataParallel(G)
+        D = nn.DataParallel(D)
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+    else:
+        # Single GPU or CPU: just move to device
+        G = G.to(device)
+        D = D.to(device)
+        if torch.cuda.is_available():
+            print(f"Using single GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print("Using CPU (no GPU available)")
 
     # Optimizers
     opt_G = optim.Adam(G.parameters(), lr=config['lr_g'], betas=(config['beta1'], config['beta2']))
