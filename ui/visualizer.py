@@ -29,7 +29,23 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-SAMPLES_DIR = os.path.join(PROJECT_ROOT, "results", "uncertainty_nih", "samples")
+# Define paths for both regular and finetuned models
+MODEL_CONFIGS = {
+    'Regular': {
+        'samples_dir': os.path.join(PROJECT_ROOT, "results", "uncertainty_nih", "cnn", "samples"),
+        'model_path': os.path.join(PROJECT_ROOT, "models", "models_uncertainty", "cnn", "gan_uncertainty_xray_best_cnn.pth"),
+        'filename_pattern': "fake_epoch_*.png",
+        'filename_extract': lambda f: int(f[len("fake_epoch_"):-len(".png")])
+    },
+    'Finetuned': {
+        'samples_dir': os.path.join(PROJECT_ROOT, "results", "uncertainty_nih_finetuned", "cnn", "samples"),
+        'model_path': os.path.join(PROJECT_ROOT, "models", "models_uncertainty_nih_finetuned", "cnn", "gan_uncertainty_xray_finetuned_best_cnn.pth"),
+        'filename_pattern': "finetuned_epoch_*_fid_*.png",
+        'filename_extract': lambda f: int(f.split('_')[2])  # Extract epoch number from finetuned_epoch_015_fid_112.97.png
+    }
+}
+
+SAMPLES_DIR = os.path.join(PROJECT_ROOT, "results", "uncertainty_nih", "cnn", "samples")
 MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "models_uncertainty", "cnn", "gan_uncertainty_xray_best_cnn.pth")
 latent_dim = 128  # Match training config
 img_size = 128    # Match training config
@@ -62,7 +78,7 @@ def load_nih_dataset():
             "alkzar90/NIH-Chest-X-ray-dataset",
             name="image-classification",
             split="train",
-            trust_remote_code=True
+            trust_remote_code=True,
         )
         
         print(f"Dataset loaded: {len(dataset):,} images")
@@ -78,27 +94,27 @@ def load_nih_dataset():
         print(f"  {os.environ.get('HF_DATASETS_CACHE')}")
         return None
 
-def get_available_epochs():
+def get_available_epochs(model_type='Regular'):
     """Get list of available epoch numbers from saved samples"""
-    pattern = os.path.join(SAMPLES_DIR, "fake_epoch_*.png")
+    config = MODEL_CONFIGS[model_type]
+    pattern = os.path.join(config['samples_dir'], config['filename_pattern'])
     files = glob.glob(pattern)
     epochs = []
     for f in files:
         basename = os.path.basename(f)
-        # Extract number between "fake_epoch_" and ".png"
-        if basename.startswith("fake_epoch_") and basename.endswith(".png"):
-            try:
-                epoch_str = basename[len("fake_epoch_"):-len(".png")]
-                epoch_num = int(epoch_str)
-                epochs.append(epoch_num)
-            except ValueError:
-                continue
+        try:
+            epoch_num = config['filename_extract'](basename)
+            epochs.append(epoch_num)
+        except (ValueError, IndexError):
+            continue
     return sorted(epochs)
 
-def load_generator():
+def load_generator(model_type='Regular'):
     """Load the trained generator model"""
-    if not os.path.exists(MODEL_PATH):
-        return None, f"Model not found at {MODEL_PATH}"
+    model_path = MODEL_CONFIGS[model_type]['model_path']
+    
+    if not os.path.exists(model_path):
+        return None, f"Model not found at {model_path}"
     
     try:
         G = Generator_CNN_Uncertainty(
@@ -108,7 +124,7 @@ def load_generator():
             img_width=img_size
         ).to(device)
         
-        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         state_dict = checkpoint["G"]
         
         # Remove 'module.' prefix if present (from DataParallel/DDP)
@@ -119,7 +135,7 @@ def load_generator():
         G.load_state_dict(state_dict, strict=False)
         G.eval()
         
-        return G, f"Loaded model from epoch {checkpoint['epoch']}"
+        return G, f"Loaded {model_type} model from epoch {checkpoint['epoch']}"
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
@@ -188,6 +204,21 @@ def generate_fake_image(generator):
         fake_img = generator(z)
     return fake_img.squeeze()
 
+def get_epoch_filename(epoch, model_type='Regular'):
+    """Get the filename for a given epoch and model type"""
+    config = MODEL_CONFIGS[model_type]
+    samples_dir = config['samples_dir']
+    
+    if model_type == 'Regular':
+        return os.path.join(samples_dir, f"fake_epoch_{epoch}.png")
+    else:  # Finetuned
+        # Find the file that matches the epoch
+        pattern = os.path.join(samples_dir, f"finetuned_epoch_{epoch:03d}_fid_*.png")
+        files = glob.glob(pattern)
+        if files:
+            return files[0]
+        return None
+
 # =========================
 # GUI Application
 # =========================
@@ -202,6 +233,7 @@ class GANVisualizerApp:
         self.current_answer = None
         self.score = 0
         self.total = 0
+        self.current_model_type = 'Regular'
         
         # Create notebook for tabs
         self.notebook = ttk.Notebook(root)
@@ -220,27 +252,37 @@ class GANVisualizerApp:
         control_frame = ttk.Frame(tab)
         control_frame.pack(side='top', fill='x', padx=10, pady=10)
         
-        ttk.Label(control_frame, text="Select Epoch:", font=('Arial', 12)).pack(side='left', padx=5)
+        # Model type selector
+        ttk.Label(control_frame, text="Model Type:", font=('Arial', 12)).pack(side='left', padx=5)
+        self.model_type_var = tk.StringVar(value='Regular')
+        model_type_dropdown = ttk.Combobox(control_frame, textvariable=self.model_type_var,
+                                          values=['Regular', 'Finetuned'],
+                                          state='readonly', width=12)
+        model_type_dropdown.pack(side='left', padx=5)
+        model_type_dropdown.bind('<<ComboboxSelected>>', self.on_model_type_changed)
+        
+        ttk.Label(control_frame, text="Select Epoch:", font=('Arial', 12)).pack(side='left', padx=(20, 5))
         
         # Get available epochs
-        self.epochs = get_available_epochs()
+        self.epochs = get_available_epochs('Regular')
         
         if not self.epochs:
-            ttk.Label(control_frame, text=f"No samples found in {SAMPLES_DIR}", 
+            ttk.Label(control_frame, text=f"No samples found", 
                      foreground='red').pack(side='left', padx=5)
         else:
             self.epoch_var = tk.StringVar(value=str(self.epochs[0]))
-            epoch_dropdown = ttk.Combobox(control_frame, textvariable=self.epoch_var, 
+            self.epoch_dropdown = ttk.Combobox(control_frame, textvariable=self.epoch_var, 
                                          values=[str(e) for e in self.epochs], 
                                          state='readonly', width=10)
-            epoch_dropdown.pack(side='left', padx=5)
+            self.epoch_dropdown.pack(side='left', padx=5)
             
             ttk.Button(control_frame, text="View Samples", 
                       command=self.view_epoch).pack(side='left', padx=5)
             
             # Info label
             info_text = f"Available epochs: {len(self.epochs)} ({min(self.epochs)}-{max(self.epochs)})"
-            ttk.Label(control_frame, text=info_text, font=('Arial', 9)).pack(side='left', padx=20)
+            self.epoch_info_label = ttk.Label(control_frame, text=info_text, font=('Arial', 9))
+            self.epoch_info_label.pack(side='left', padx=20)
         
         # Image display frame
         self.epoch_canvas_frame = ttk.Frame(tab)
@@ -262,11 +304,24 @@ class GANVisualizerApp:
                                      font=('Arial', 12))
         self.score_label.pack(pady=5)
         
+        # Model type selector for game
+        model_selector_frame = ttk.Frame(top_frame)
+        model_selector_frame.pack(pady=5)
+        
+        ttk.Label(model_selector_frame, text="Generator:", font=('Arial', 10)).pack(side='left', padx=5)
+        self.game_model_type_var = tk.StringVar(value='Regular')
+        game_model_dropdown = ttk.Combobox(model_selector_frame, textvariable=self.game_model_type_var,
+                                          values=['Regular', 'Finetuned'],
+                                          state='readonly', width=12)
+        game_model_dropdown.pack(side='left', padx=5)
+        game_model_dropdown.bind('<<ComboboxSelected>>', self.on_game_model_type_changed)
+        
         # Load generator
-        self.generator, msg = load_generator()
+        self.generator, msg = load_generator('Regular')
         status_color = 'green' if self.generator else 'red'
-        ttk.Label(top_frame, text=msg, foreground=status_color, 
-                 font=('Arial', 9)).pack()
+        self.game_status_label = ttk.Label(top_frame, text=msg, foreground=status_color, 
+                 font=('Arial', 9))
+        self.game_status_label.pack()
         
         # Image display frame
         self.game_canvas_frame = ttk.Frame(tab)
@@ -276,30 +331,57 @@ class GANVisualizerApp:
         control_frame = ttk.Frame(tab)
         control_frame.pack(side='bottom', fill='x', padx=10, pady=10)
         
-        ttk.Button(control_frame, text="New Round", command=self.new_game_round, 
-                  state='normal' if self.generator else 'disabled').pack(side='left', padx=5)
+        self.new_round_button = ttk.Button(control_frame, text="New Round", command=self.new_game_round, 
+                  state='normal' if self.generator else 'disabled')
+        self.new_round_button.pack(side='left', padx=5)
         
-        ttk.Button(control_frame, text="Real", command=lambda: self.make_guess('r'), 
-                  state='disabled').pack(side='left', padx=5)
-        self.real_button = control_frame.winfo_children()[-1]
+        self.real_button = ttk.Button(control_frame, text="Real", command=lambda: self.make_guess('r'), 
+                  state='disabled')
+        self.real_button.pack(side='left', padx=5)
         
-        ttk.Button(control_frame, text="Fake", command=lambda: self.make_guess('f'), 
-                  state='disabled').pack(side='left', padx=5)
-        self.fake_button = control_frame.winfo_children()[-1]
+        self.fake_button = ttk.Button(control_frame, text="Fake", command=lambda: self.make_guess('f'), 
+                  state='disabled')
+        self.fake_button.pack(side='left', padx=5)
         
         ttk.Button(control_frame, text="Reset Score", command=self.reset_score).pack(side='right', padx=5)
         
         self.result_label = ttk.Label(control_frame, text="", font=('Arial', 11, 'bold'))
         self.result_label.pack(side='left', padx=20)
+    
+    def on_model_type_changed(self, event=None):
+        """Handle model type selection change in epoch viewer"""
+        model_type = self.model_type_var.get()
+        self.epochs = get_available_epochs(model_type)
+        
+        if self.epochs:
+            self.epoch_var.set(str(self.epochs[0]))
+            self.epoch_dropdown['values'] = [str(e) for e in self.epochs]
+            info_text = f"Available epochs: {len(self.epochs)} ({min(self.epochs)}-{max(self.epochs)})"
+            self.epoch_info_label.config(text=info_text)
+        else:
+            self.epoch_var.set("")
+            self.epoch_dropdown['values'] = []
+            self.epoch_info_label.config(text="No samples found")
+    
+    def on_game_model_type_changed(self, event=None):
+        """Handle model type selection change in game tab"""
+        model_type = self.game_model_type_var.get()
+        self.generator, msg = load_generator(model_type)
+        status_color = 'green' if self.generator else 'red'
+        self.game_status_label.config(text=msg, foreground=status_color)
+        
+        # Enable/disable new round button
+        self.new_round_button.config(state='normal' if self.generator else 'disabled')
         
     def view_epoch(self):
         """Display samples from selected epoch"""
         try:
             epoch = int(self.epoch_var.get())
-            img_path = os.path.join(SAMPLES_DIR, f"fake_epoch_{epoch}.png")
+            model_type = self.model_type_var.get()
+            img_path = get_epoch_filename(epoch, model_type)
             
-            if not os.path.exists(img_path):
-                messagebox.showerror("Error", f"Image not found: {img_path}")
+            if img_path is None or not os.path.exists(img_path):
+                messagebox.showerror("Error", f"Image not found for epoch {epoch}")
                 return
             
             # Clear previous canvas
@@ -310,7 +392,7 @@ class GANVisualizerApp:
             img = mpimg.imread(img_path)
             fig, ax = plt.subplots(figsize=(8, 8))
             ax.imshow(img, cmap='gray' if len(img.shape) == 2 else None)
-            ax.set_title(f"Generated Samples - Epoch {epoch}", fontsize=14)
+            ax.set_title(f"{model_type} Generated Samples - Epoch {epoch}", fontsize=14)
             ax.axis('off')
             
             canvas = FigureCanvasTkAgg(fig, master=self.epoch_canvas_frame)
