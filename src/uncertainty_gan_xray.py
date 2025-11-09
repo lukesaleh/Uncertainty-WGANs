@@ -758,23 +758,32 @@ def setup_distributed():
     
     # Check if running with SLURM
     elif 'SLURM_PROCID' in os.environ:
-        rank = int(os.environ['SLURM_PROCID'])
-        local_rank = int(os.environ['SLURM_LOCALID'])
-        world_size = int(os.environ['SLURM_NTASKS'])
+        world_size = int(os.environ.get('SLURM_NTASKS', 1))
         
-        # Initialize process group
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            world_size=world_size,
-            rank=rank
-        )
-        
-        torch.cuda.set_device(local_rank)
-        return local_rank
+        # Only initialize distributed training if world_size > 1
+        if world_size > 1:
+            rank = int(os.environ['SLURM_PROCID'])
+            local_rank = int(os.environ['SLURM_LOCALID'])
+            
+            # Initialize process group
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                world_size=world_size,
+                rank=rank
+            )
+            
+            torch.cuda.set_device(local_rank)
+            return local_rank
+        else:
+            # Single GPU SLURM job - no distributed training needed
+            print("SLURM detected but only 1 task - running in single-GPU mode")
+            print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+            # Don't set device - let CUDA_VISIBLE_DEVICES handle it
+            return None  # Return None to signal single-GPU mode
     
     # No distributed training
-    return 0
+    return None  # Return None for single-GPU/CPU mode
 
 if __name__ == "__main__":
     os.environ['HF_HOME'] = '/blue/azare/lukesaleh/.cache/huggingface'
@@ -784,7 +793,17 @@ if __name__ == "__main__":
     
     # Setup distributed training if available
     local_rank = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    
+    # Set device based on local_rank
+    if local_rank is not None:
+        # Distributed mode - use specific device
+        device = torch.device(f"cuda:{local_rank}")
+    elif torch.cuda.is_available():
+        # Single GPU mode - use default cuda device
+        device = torch.device("cuda")
+    else:
+        # CPU mode
+        device = torch.device("cpu")
     
     # Performance diagnostics
     print(f"\n{'='*70}")
@@ -827,13 +846,13 @@ if __name__ == "__main__":
             'uncertainty_lambda': 1.0,
             'n_critic': 3,
             'patience': 20,
-            'run_test': False,
+            'run_test': True,
             'use_cnn_generator': True,
             'img_height': 128,      
             'img_width': 128,       
             'img_channels': 1,
             'max_fid_samples': 5000,
-            'resume_from_checkpoint': True,
+            'resume_from_checkpoint': False,
             'checkpoint_to_load': None
         }
         
@@ -850,13 +869,12 @@ if __name__ == "__main__":
         model_type = "mlp"
         config['model_name_append'] = "mlp"
     
-    # Create directories
     config['model_dir'] = os.path.join(os.getcwd(), "models", "models_uncertainty_nih", model_type)
     config['checkpoint_dir'] = os.path.join(os.getcwd(), "models", "models_uncertainty_nih", f"{model_type}_checkpoints")
     config['sample_dir'] = os.path.join(os.getcwd(), "results", "uncertainty_nih", model_type, "samples")
     config['test_dir'] = os.path.join(os.getcwd(), "results", "uncertainty_nih", model_type, "test")
     
-    config['model_to_load'] = os.path.join(config['model_dir'], f"gan_uncertainty_nih_best_{model_type}.pth")
+    config['model_to_load'] = os.path.join(config['model_dir'], f"gan_uncertainty_xray_best_{model_type}.pth")
 
     os.makedirs(config['model_dir'], exist_ok=True)
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
