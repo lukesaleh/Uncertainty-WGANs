@@ -190,3 +190,51 @@ class Critic_Simple(nn.Module):
 
     def forward(self, x):
         return self.net(x).view(-1)
+
+class DCGANDiscriminator128(nn.Module):
+    """
+    DCGAN-style discriminator for 128x128 images
+    """
+    def __init__(self, img_channels=1, base_channels=64, use_sigmoid=False):
+        super().__init__()
+
+        self.main = nn.Sequential(
+            # 128x128 -> 64x64
+            nn.Conv2d(img_channels, base_channels, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 64x64 -> 32x32
+            nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 32x32 -> 16x16
+            nn.Conv2d(base_channels * 2, base_channels * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 16x16 -> 8x8
+            nn.Conv2d(base_channels * 4, base_channels * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(base_channels * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 8x8 -> 4x4
+            nn.Conv2d(base_channels * 8, base_channels * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(base_channels * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # 4x4 -> 1x1
+            nn.Conv2d(base_channels * 8, 1, 4, 1, 0, bias=False),
+            # for vanilla DCGAN (BCE), turn this on:
+            # nn.Sigmoid()
+        )
+
+        self.use_sigmoid = use_sigmoid
+
+    def forward(self, x):
+        out = self.main(x)
+        # out shape: (N, 1, 1, 1)
+        out = out.view(-1)
+        if self.use_sigmoid:
+            out = torch.sigmoid(out)
+        return out
