@@ -17,6 +17,8 @@ sys.path.append(PROJECT_ROOT)
 from datasets import load_dataset
 # Import the actual model from your models module
 from src.models import Generator_CNN_Uncertainty
+# Add critic import
+from src.models import Critic
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,33 +31,61 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
+# Define the best models directory
+BEST_MODELS_DIR = os.path.join(PROJECT_ROOT, "models", "best")
+
+# Function to find the correct model files
+def find_model_path(model_type):
+    """Find the model file in the best directory based on type"""
+    if not os.path.exists(BEST_MODELS_DIR):
+        print(f"Warning: Best models directory not found: {BEST_MODELS_DIR}")
+        return None
+    
+    model_files = glob.glob(os.path.join(BEST_MODELS_DIR, "*.pth"))
+    
+    if model_type == 'Regular':
+        # Find model WITHOUT 'finetuned' in the name
+        for model_file in model_files:
+            if 'finetuned' not in os.path.basename(model_file).lower():
+                return model_file
+    else:  # Finetuned
+        # Find model WITH 'finetuned' in the name
+        for model_file in model_files:
+            if 'finetuned' in os.path.basename(model_file).lower():
+                return model_file
+    
+    return None
+
 # Define paths for both regular and finetuned models
 MODEL_CONFIGS = {
     'Regular': {
         'samples_dir': os.path.join(PROJECT_ROOT, "results", "uncertainty_nih", "cnn", "samples"),
-        'model_path': os.path.join(PROJECT_ROOT, "models", "models_uncertainty", "cnn", "gan_uncertainty_xray_best_cnn.pth"),
+        'model_path': find_model_path('Regular'),
         'filename_pattern': "fake_epoch_*.png",
         'filename_extract': lambda f: int(f[len("fake_epoch_"):-len(".png")])
     },
     'Finetuned': {
         'samples_dir': os.path.join(PROJECT_ROOT, "results", "uncertainty_nih_finetuned", "cnn", "samples"),
-        'model_path': os.path.join(PROJECT_ROOT, "models", "models_uncertainty_nih_finetuned", "cnn", "gan_uncertainty_xray_finetuned_best_cnn.pth"),
+        'model_path': find_model_path('Finetuned'),
         'filename_pattern': "finetuned_epoch_*_fid_*.png",
         'filename_extract': lambda f: int(f.split('_')[2])  # Extract epoch number from finetuned_epoch_015_fid_112.97.png
     }
 }
 
-SAMPLES_DIR = os.path.join(PROJECT_ROOT, "results", "uncertainty_nih", "cnn", "samples")
-MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "models_uncertainty", "cnn", "gan_uncertainty_xray_best_cnn.pth")
+SAMPLES_DIR = MODEL_CONFIGS['Regular']['samples_dir']
+MODEL_PATH = MODEL_CONFIGS['Regular']['model_path']
 latent_dim = 128  # Match training config
 img_size = 128    # Match training config
 
 # Debug: Print paths
 print(f"Project Root: {PROJECT_ROOT}")
+print(f"Best Models Dir: {BEST_MODELS_DIR}")
+print(f"Regular Model Path: {MODEL_CONFIGS['Regular']['model_path']}")
+print(f"Finetuned Model Path: {MODEL_CONFIGS['Finetuned']['model_path']}")
 print(f"Samples Dir: {SAMPLES_DIR}")
-print(f"Model Path: {MODEL_PATH}")
-print(f"Samples Dir Exists: {os.path.exists(SAMPLES_DIR)}")
-print(f"Model Exists: {os.path.exists(MODEL_PATH)}")
+print(f"Best Models Dir Exists: {os.path.exists(BEST_MODELS_DIR)}")
+print(f"Regular Model Exists: {MODEL_CONFIGS['Regular']['model_path'] and os.path.exists(MODEL_CONFIGS['Regular']['model_path'])}")
+print(f"Finetuned Model Exists: {MODEL_CONFIGS['Finetuned']['model_path'] and os.path.exists(MODEL_CONFIGS['Finetuned']['model_path'])}")
 
 # =========================
 # Helper Functions
@@ -109,12 +139,12 @@ def get_available_epochs(model_type='Regular'):
             continue
     return sorted(epochs)
 
-def load_generator(model_type='Regular'):
-    """Load the trained generator model"""
+def load_models(model_type='Regular'):
+    """Load both generator and critic models"""
     model_path = MODEL_CONFIGS[model_type]['model_path']
     
     if not os.path.exists(model_path):
-        return None, f"Model not found at {model_path}"
+        return None, None, f"Model not found at {model_path}"
     
     try:
         G = Generator_CNN_Uncertainty(
@@ -124,22 +154,34 @@ def load_generator(model_type='Regular'):
             img_width=img_size
         ).to(device)
         
+        D = Critic(
+            img_channels=1,
+            img_height=img_size,
+            img_width=img_size
+        ).to(device)
+        
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        state_dict = checkpoint["G"]
         
-        # Remove 'module.' prefix if present (from DataParallel/DDP)
-        if list(state_dict.keys())[0].startswith('module.'):
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        # Load generator
+        g_state_dict = checkpoint["G"]
+        if list(g_state_dict.keys())[0].startswith('module.'):
+            g_state_dict = {k.replace('module.', ''): v for k, v in g_state_dict.items()}
+        G.load_state_dict(g_state_dict, strict=False)
         
-        # Load state dict
-        G.load_state_dict(state_dict, strict=False)
+        # Load critic
+        d_state_dict = checkpoint["D"]
+        if list(d_state_dict.keys())[0].startswith('module.'):
+            d_state_dict = {k.replace('module.', ''): v for k, v in d_state_dict.items()}
+        D.load_state_dict(d_state_dict, strict=False)
+        
         G.eval()
+        D.eval()
         
-        return G, f"Loaded {model_type} model from epoch {checkpoint['epoch']}"
+        return G, D, f"Loaded {model_type} model from epoch {checkpoint['epoch']}"
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        return None, f"Error loading model: {str(e)}\n\nDetails:\n{error_details}"
+        return None, None, f"Error loading model: {str(e)}\n\nDetails:\n{error_details}"
 
 def load_random_real_image():
     """Load a random real image from the Hugging Face NIH dataset"""
@@ -230,7 +272,9 @@ class GANVisualizerApp:
         
         # Variables
         self.generator = None
+        self.critic = None  # Add critic
         self.current_answer = None
+        self.current_image = None  # Store current image for critic scoring
         self.score = 0
         self.total = 0
         self.current_model_type = 'Regular'
@@ -304,6 +348,11 @@ class GANVisualizerApp:
                                      font=('Arial', 12))
         self.score_label.pack(pady=5)
         
+        # Add critic score label
+        self.critic_score_label = ttk.Label(top_frame, text="Critic Score: --", 
+                                           font=('Arial', 11))
+        self.critic_score_label.pack(pady=2)
+        
         # Model type selector for game
         model_selector_frame = ttk.Frame(top_frame)
         model_selector_frame.pack(pady=5)
@@ -316,8 +365,8 @@ class GANVisualizerApp:
         game_model_dropdown.pack(side='left', padx=5)
         game_model_dropdown.bind('<<ComboboxSelected>>', self.on_game_model_type_changed)
         
-        # Load generator
-        self.generator, msg = load_generator('Regular')
+        # Load both generator and critic
+        self.generator, self.critic, msg = load_models('Regular')
         status_color = 'green' if self.generator else 'red'
         self.game_status_label = ttk.Label(top_frame, text=msg, foreground=status_color, 
                  font=('Arial', 9))
@@ -366,13 +415,25 @@ class GANVisualizerApp:
     def on_game_model_type_changed(self, event=None):
         """Handle model type selection change in game tab"""
         model_type = self.game_model_type_var.get()
-        self.generator, msg = load_generator(model_type)
+        self.generator, self.critic, msg = load_models(model_type)
         status_color = 'green' if self.generator else 'red'
         self.game_status_label.config(text=msg, foreground=status_color)
         
         # Enable/disable new round button
         self.new_round_button.config(state='normal' if self.generator else 'disabled')
         
+    def get_critic_score(self, img_tensor):
+        """Compute critic score for an image"""
+        if self.critic is None:
+            return None
+        
+        with torch.no_grad():
+            # Add batch dimension if needed
+            if img_tensor.dim() == 3:
+                img_tensor = img_tensor.unsqueeze(0)
+            score = self.critic(img_tensor).item()
+        return score
+    
     def view_epoch(self):
         """Display samples from selected epoch"""
         try:
@@ -421,10 +482,23 @@ class GANVisualizerApp:
                 if img is None:
                     messagebox.showerror("Error", "Could not load real image")
                     return
+                self.current_image = img.unsqueeze(0).to(device)  # Store for critic
                 img_display = img.cpu().numpy().squeeze()
             else:
                 img = generate_fake_image(self.generator)
+                self.current_image = img.unsqueeze(0).to(device)  # Store for critic
                 img_display = img.cpu().numpy().squeeze()
+            
+            # Get critic score
+            critic_score = self.get_critic_score(self.current_image)
+            if critic_score is not None:
+                # Higher scores = more "real" according to critic
+                self.critic_score_label.config(
+                    text=f"Critic Score: {critic_score:.3f} ({'Real-like' if critic_score > 0 else 'Fake-like'})",
+                    foreground='blue'
+                )
+            else:
+                self.critic_score_label.config(text="Critic Score: --", foreground='gray')
             
             # Convert from [-1, 1] to [0, 1]
             img_display = (img_display + 1) / 2.0
@@ -460,16 +534,30 @@ class GANVisualizerApp:
         correct = (guess == self.current_answer)
         self.total += 1
         
+        # Get critic score for feedback
+        critic_score = self.get_critic_score(self.current_image) if self.current_image is not None else None
+        
         if correct:
             self.score += 1
-            self.result_label.config(text="✓ Correct!", foreground='green')
+            result_text = "✓ Correct!"
+            if critic_score is not None:
+                critic_verdict = "agreed" if (guess == 'r' and critic_score > 0) or (guess == 'f' and critic_score < 0) else "disagreed"
+                result_text += f" (Critic {critic_verdict})"
+            self.result_label.config(text=result_text, foreground='green')
         else:
             answer_text = "REAL" if self.current_answer == 'r' else "FAKE"
-            self.result_label.config(text=f"✗ Wrong! It was {answer_text}", foreground='red')
+            result_text = f"✗ Wrong! It was {answer_text}"
+            if critic_score is not None:
+                critic_correct = (self.current_answer == 'r' and critic_score > 0) or (self.current_answer == 'f' and critic_score < 0)
+                result_text += f" (Critic was {'right' if critic_correct else 'wrong'})"
+            self.result_label.config(text=result_text, foreground='red')
         
-        # Update score
-        percentage = (self.score / self.total * 100) if self.total > 0 else 0
-        self.score_label.config(text=f"Score: {self.score}/{self.total} ({percentage:.1f}%)")
+        # Update critic score label with final verdict
+        if critic_score is not None:
+            self.critic_score_label.config(
+                text=f"Critic Score: {critic_score:.3f} → Predicted: {'REAL' if critic_score > 0 else 'FAKE'}",
+                foreground='green' if (critic_score > 0 and self.current_answer == 'r') or (critic_score < 0 and self.current_answer == 'f') else 'red'
+            )
         
         self.current_answer = None
     
