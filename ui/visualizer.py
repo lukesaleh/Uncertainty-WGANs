@@ -270,6 +270,9 @@ class GANVisualizerApp:
         self.root.title("Uncertainty GAN Visualizer")
         self.root.geometry("900x700")
         
+        # Handle window closing
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         # Variables
         self.generator = None
         self.critic = None  # Add critic
@@ -559,6 +562,10 @@ class GANVisualizerApp:
                 foreground='green' if (critic_score > 0 and self.current_answer == 'r') or (critic_score < 0 and self.current_answer == 'f') else 'red'
             )
         
+        # Update score label
+        percentage = (self.score / self.total * 100) if self.total > 0 else 0
+        self.score_label.config(text=f"Score: {self.score}/{self.total} ({percentage:.1f}%)")
+
         self.current_answer = None
     
     def reset_score(self):
@@ -567,6 +574,11 @@ class GANVisualizerApp:
         self.total = 0
         self.score_label.config(text="Score: 0/0 (0.0%)")
         self.result_label.config(text="")
+
+    def on_closing(self):
+        """Handle window closing"""
+        self.root.destroy()
+        sys.exit()
 
 # =========================
 # Main
